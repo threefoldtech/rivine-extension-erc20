@@ -8,6 +8,7 @@ import (
 
 	erc20ext "github.com/threefoldtech/rivine-extension-erc20"
 	erc20types "github.com/threefoldtech/rivine-extension-erc20/types"
+
 	"github.com/threefoldtech/rivine/pkg/api"
 	types "github.com/threefoldtech/rivine/types"
 )
@@ -20,12 +21,12 @@ type (
 	}
 	// PluginGetERC20TransactionID contains the requested info found for the given ERC20 TransactionID.
 	PluginGetERC20TransactionID struct {
-		ERC20TransaxtionID   erc20types.ERC20Hash `json:"er20txid"`
-		TfchainTransactionID types.TransactionID  `json:"tfttxid"`
+		ERC20TransactionID erc20types.ERC20Hash `json:"er20txid"`
+		TransactionID      types.TransactionID  `json:"tfttxid"`
 	}
 )
 
-// RegisterERC20HTTPHandlers registers the (tfchain-specific) handlers for all ERC20 HTTP endpoints.
+// RegisterERC20HTTPHandlers registers the custom handlers for all ERC20 HTTP endpoints.
 func RegisterERC20HTTPHandlers(router httprouter.Router, erc20plugin *erc20ext.Plugin) {
 	if erc20plugin == nil {
 		panic("no erc20plugin given")
@@ -102,8 +103,8 @@ func NewPluginGetERC20TransactionID(plugin *erc20ext.Plugin) httprouter.Handle {
 		}
 
 		api.WriteJSON(w, PluginGetERC20TransactionID{
-			ERC20TransaxtionID:   txid,
-			TfchainTransactionID: tfttxid,
+			ERC20TransactionID: txid,
+			TransactionID:      tfttxid,
 		})
 	}
 }

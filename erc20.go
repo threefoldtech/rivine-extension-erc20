@@ -20,16 +20,32 @@ const (
 
 var (
 	// buckets for the ERC20-bridge feature
-	bucketERC20ToTFTAddresses = []byte("addresses_erc20_to_tft") // erc20 => TFT
-	bucketTFTToERC20Addresses = []byte("addresses_tft_to_erc20") // TFT => erc20
-	bucketERC20TransactionIDs = []byte("erc20_transactionids")   // stores all unique ERC20 transaction ids used for erc20=>TFT exchanges
+	bucketERC20ToRivineAddresses = []byte("addresses_erc20_to_riv") // erc20 => Rivine
+	bucketRivineToERC20Addresses = []byte("addresses_riv_to_erc20") // Rivine => erc20
+	bucketERC20TransactionIDs    = []byte("erc20_transactionids")   // stores all unique ERC20 transaction ids used for erc20=>Rivine exchanges
 )
 
 type (
-	// Plugin is a struct defines the minting plugin
+	// Plugin is a struct defines the ERC20 extension plugin
 	Plugin struct {
 		storage            modules.PluginViewStorage
 		unregisterCallback modules.PluginUnregisterCallback
+
+		coinCreationTxVersion        rivinetypes.TransactionVersion
+		addressRegistrationTxVersion rivinetypes.TransactionVersion
+	}
+
+	// PluginConfig is used when creating the ERC20 extension plugin,
+	// all parameters are required
+	PluginConfig struct {
+		ERC20FeePoolAddress  rivinetypes.UnlockHash
+		OneCoin              rivinetypes.Currency
+		TransactionValidator types.ERC20TransactionValidator
+
+		// transaction version
+		ConvertTransactionVersion             rivinetypes.TransactionVersion
+		CoinCreationTransactionVersion        rivinetypes.TransactionVersion
+		AddressRegistrationTransactionVersion rivinetypes.TransactionVersion
 	}
 
 	transactionContext struct {
@@ -39,21 +55,52 @@ type (
 	}
 )
 
-// NewERC20Plugin creates a new erc20 plugin
-func NewERC20Plugin(ERC20FeePoolAddress rivinetypes.UnlockHash, oneCoin rivinetypes.Currency, erc20TxValidator types.ERC20TransactionValidator) *Plugin {
-	p := &Plugin{}
-	rivinetypes.RegisterTransactionVersion(types.TransactionVersionERC20Conversion, types.ERC20ConvertTransactionController{})
-	rivinetypes.RegisterTransactionVersion(types.TransactionVersionERC20CoinCreation, types.ERC20CoinCreationTransactionController{
-		Registry:    p,
-		OneCoin:     oneCoin,
-		TxValidator: erc20TxValidator,
+func (cfg *PluginConfig) validate() error {
+	if cfg.ERC20FeePoolAddress.Cmp(rivinetypes.NilUnlockHash) == 0 {
+		return errors.New("required config parameter ERC20FeePoolAddress is not defined (nil unlockhash is not allowed)")
+	}
+	if cfg.OneCoin.IsZero() {
+		return errors.New("required config parameter OneCoin is not defined (0 is not allowed)")
+	}
+	if cfg.TransactionValidator == nil {
+		return errors.New("required config parameter TransactionValidator is not defined (nil is not allowed)")
+	}
+	if cfg.ConvertTransactionVersion == 0 {
+		return errors.New("required config parameter ConvertTransactionVersion is not defined (0 is not allowed)")
+	}
+	if cfg.CoinCreationTransactionVersion == 0 {
+		return errors.New("required config parameter CoinCreationTransactionVersion is not defined (0 is not allowed)")
+	}
+	if cfg.AddressRegistrationTransactionVersion == 0 {
+		return errors.New("required config parameter AddressRegistrationTransactionVersion is not defined (0 is not allowed)")
+	}
+	return nil
+}
+
+// NewPlugin creates a new ERC20-Extension plugin
+func NewPlugin(cfg PluginConfig) (*Plugin, error) {
+	err := cfg.validate()
+	if err != nil {
+		return nil, err
+	}
+	p := &Plugin{
+		coinCreationTxVersion:        cfg.CoinCreationTransactionVersion,
+		addressRegistrationTxVersion: cfg.AddressRegistrationTransactionVersion,
+	}
+	rivinetypes.RegisterTransactionVersion(cfg.ConvertTransactionVersion, types.ERC20ConvertTransactionController{TransactionVersion: cfg.ConvertTransactionVersion})
+	rivinetypes.RegisterTransactionVersion(cfg.CoinCreationTransactionVersion, types.ERC20CoinCreationTransactionController{
+		Registry:           p,
+		OneCoin:            cfg.OneCoin,
+		TxValidator:        cfg.TransactionValidator,
+		TransactionVersion: cfg.CoinCreationTransactionVersion,
 	})
-	rivinetypes.RegisterTransactionVersion(types.TransactionVersionERC20AddressRegistration, types.ERC20AddressRegistrationTransactionController{
+	rivinetypes.RegisterTransactionVersion(cfg.AddressRegistrationTransactionVersion, types.ERC20AddressRegistrationTransactionController{
 		Registry:             p,
-		OneCoin:              oneCoin,
-		BridgeFeePoolAddress: ERC20FeePoolAddress,
+		OneCoin:              cfg.OneCoin,
+		BridgeFeePoolAddress: cfg.ERC20FeePoolAddress,
+		TransactionVersion:   cfg.AddressRegistrationTransactionVersion,
 	})
-	return p
+	return p, nil
 }
 
 // InitPlugin initializes the Bucket for the first time
@@ -62,8 +109,8 @@ func (p *Plugin) InitPlugin(metadata *persist.Metadata, bucket *bolt.Bucket, sto
 	p.unregisterCallback = unregisterCallback
 	if metadata == nil {
 		buckets := [][]byte{
-			bucketERC20ToTFTAddresses,
-			bucketTFTToERC20Addresses,
+			bucketERC20ToRivineAddresses,
+			bucketRivineToERC20Addresses,
 			bucketERC20TransactionIDs,
 		}
 		var err error
@@ -78,8 +125,10 @@ func (p *Plugin) InitPlugin(metadata *persist.Metadata, bucket *bolt.Bucket, sto
 			Version: pluginDBVersion,
 			Header:  pluginDBHeader,
 		}
-	} else if metadata.Version != pluginDBVersion || metadata.Header != pluginDBHeader {
-		return persist.Metadata{}, errors.New("There is only 1 version of this plugin, version mismatch")
+	} else if metadata.Version != pluginDBVersion {
+		return persist.Metadata{}, errors.New("There is only 1 version of this (ERC20) plugin, version mismatch")
+	} else if metadata.Header != pluginDBHeader {
+		return persist.Metadata{}, errors.New("wrong (ERC20) plugin DB header")
 	}
 	return *metadata, nil
 }
@@ -102,9 +151,9 @@ func (p *Plugin) ApplyBlock(block rivinetypes.Block, height rivinetypes.BlockHei
 		}
 		// check the version and handle the ones we care about
 		switch rtx.Version {
-		case types.TransactionVersionERC20CoinCreation:
+		case p.coinCreationTxVersion:
 			err = p.applyERC20CoinCreationTx(tx, ctx, rtx)
-		case types.TransactionVersionERC20AddressRegistration:
+		case p.addressRegistrationTxVersion:
 			err = p.applyERC20AddressRegistrationTx(tx, ctx, rtx)
 		}
 	}
@@ -131,9 +180,9 @@ func (p *Plugin) RevertBlock(block rivinetypes.Block, height rivinetypes.BlockHe
 
 		// check the version and handle the ones we care about
 		switch rtx.Version {
-		case types.TransactionVersionERC20CoinCreation:
+		case p.coinCreationTxVersion:
 			err = p.revertERC20CoinCreationTx(tx, ctx, rtx)
-		case types.TransactionVersionERC20AddressRegistration:
+		case p.addressRegistrationTxVersion:
 			err = p.revertERC20AddressRegistrationTx(tx, ctx, rtx)
 		}
 	}
@@ -147,31 +196,31 @@ func (p *Plugin) Close() error {
 }
 
 func (p *Plugin) applyERC20AddressRegistrationTx(tx *bolt.Tx, ctx transactionContext, rtx *rivinetypes.Transaction) error {
-	etartx, err := types.ERC20AddressRegistrationTransactionFromTransaction(*rtx)
+	etartx, err := types.ERC20AddressRegistrationTransactionFromTransaction(*rtx, p.addressRegistrationTxVersion)
 	if err != nil {
 		return fmt.Errorf("unexpected error while unpacking the ERC20 Address Registration tx type: %v", err)
 	}
 
-	tftaddr := rivinetypes.NewPubKeyUnlockHash(etartx.PublicKey)
-	erc20addr := types.ERC20AddressFromUnlockHash(tftaddr)
+	addr := rivinetypes.NewPubKeyUnlockHash(etartx.PublicKey)
+	erc20addr := types.ERC20AddressFromUnlockHash(addr)
 
-	return applyERC20AddressMapping(tx, tftaddr, erc20addr)
+	return applyERC20AddressMapping(tx, addr, erc20addr)
 }
 
 func (p *Plugin) revertERC20AddressRegistrationTx(tx *bolt.Tx, ctx transactionContext, rtx *rivinetypes.Transaction) error {
-	etartx, err := types.ERC20AddressRegistrationTransactionFromTransaction(*rtx)
+	etartx, err := types.ERC20AddressRegistrationTransactionFromTransaction(*rtx, p.addressRegistrationTxVersion)
 	if err != nil {
 		return fmt.Errorf("unexpected error while unpacking the ERC20 Address Registration tx type: %v", err)
 	}
 
-	tftaddr := rivinetypes.NewPubKeyUnlockHash(etartx.PublicKey)
-	erc20addr := types.ERC20AddressFromUnlockHash(tftaddr)
+	addr := rivinetypes.NewPubKeyUnlockHash(etartx.PublicKey)
+	erc20addr := types.ERC20AddressFromUnlockHash(addr)
 
-	return revertERC20AddressMapping(tx, tftaddr, erc20addr)
+	return revertERC20AddressMapping(tx, addr, erc20addr)
 }
 
 func (p *Plugin) applyERC20CoinCreationTx(tx *bolt.Tx, ctx transactionContext, rtx *rivinetypes.Transaction) error {
-	etcctx, err := types.ERC20CoinCreationTransactionFromTransaction(*rtx)
+	etcctx, err := types.ERC20CoinCreationTransactionFromTransaction(*rtx, p.coinCreationTxVersion)
 	if err != nil {
 		return fmt.Errorf("unexpected error while unpacking the ERC20 Coin Creation Tx type: %v", err)
 	}
@@ -179,19 +228,19 @@ func (p *Plugin) applyERC20CoinCreationTx(tx *bolt.Tx, ctx transactionContext, r
 }
 
 func (p *Plugin) revertERC20CoinCreationTx(tx *bolt.Tx, ctx transactionContext, rtx *rivinetypes.Transaction) error {
-	etcctx, err := types.ERC20CoinCreationTransactionFromTransaction(*rtx)
+	etcctx, err := types.ERC20CoinCreationTransactionFromTransaction(*rtx, p.coinCreationTxVersion)
 	if err != nil {
 		return fmt.Errorf("unexpected error while unpacking the ERC20 Coin Creation Tx type: %v", err)
 	}
 	return revertERC20TransactionID(tx, etcctx.TransactionID)
 }
 
-// GetERC20AddressForTFTAddress returns the mapped ERC20 address for the given TFT Address,
-// if the TFT Address has registered an ERC20 address explicitly.
-func (p *Plugin) GetERC20AddressForTFTAddress(uh rivinetypes.UnlockHash) (addr types.ERC20Address, found bool, err error) {
+// GetERC20AddressForRivineAddress returns the mapped ERC20 address for the given (Rivine) Address,
+// if the (Rivine) Address has registered an ERC20 address explicitly.
+func (p *Plugin) GetERC20AddressForRivineAddress(uh rivinetypes.UnlockHash) (addr types.ERC20Address, found bool, err error) {
 	err = p.storage.View(func(bucket *bolt.Bucket) error {
 		tx := bucket.Tx()
-		addr, found, err = getERC20AddressForTFTAddress(tx, uh)
+		addr, found, err = getERC20AddressForRivineAddress(tx, uh)
 		if err != nil {
 			return err
 		}
@@ -200,12 +249,12 @@ func (p *Plugin) GetERC20AddressForTFTAddress(uh rivinetypes.UnlockHash) (addr t
 	return
 }
 
-// GetTFTAddressForERC20Address returns the mapped TFT address for the given ERC20 Address,
-// if the TFT Address has registered an ERC20 address explicitly.
-func (p *Plugin) GetTFTAddressForERC20Address(addr types.ERC20Address) (uh rivinetypes.UnlockHash, found bool, err error) {
+// GetRivineAddressForERC20Address returns the mapped (Rivine) address for the given ERC20 Address,
+// if the (Rivine) Address has registered an ERC20 address explicitly.
+func (p *Plugin) GetRivineAddressForERC20Address(addr types.ERC20Address) (uh rivinetypes.UnlockHash, found bool, err error) {
 	err = p.storage.View(func(bucket *bolt.Bucket) error {
 		tx := bucket.Tx()
-		uh, found, err = getTFTAddressForERC20Address(tx, addr)
+		uh, found, err = getRivineAddressForERC20Address(tx, addr)
 		if err != nil {
 			return err
 		}
@@ -214,12 +263,12 @@ func (p *Plugin) GetTFTAddressForERC20Address(addr types.ERC20Address) (uh rivin
 	return
 }
 
-// GetTFTTransactionIDForERC20TransactionID returns the mapped TFT TransactionID for the given ERC20 TransactionID,
+// GetTransactionIDForERC20TransactionID returns the mapped (Rivine) TransactionID for the given ERC20 TransactionID,
 // if the ERC20 TransactionID has been used to fund an ERC20 CoinCreation Tx and has been registered as such, a nil TransactionID is returned otherwise.
-func (p *Plugin) GetTFTTransactionIDForERC20TransactionID(id types.ERC20Hash) (txid rivinetypes.TransactionID, found bool, err error) {
+func (p *Plugin) GetTransactionIDForERC20TransactionID(id types.ERC20Hash) (txid rivinetypes.TransactionID, found bool, err error) {
 	err = p.storage.View(func(bucket *bolt.Bucket) error {
 		tx := bucket.Tx()
-		txid, found, err = getTfchainTransactionIDForERC20TransactionID(tx, id)
+		txid, found, err = getTransactionIDForERC20TransactionID(tx, id)
 		if err != nil {
 			return err
 		}
@@ -228,63 +277,63 @@ func (p *Plugin) GetTFTTransactionIDForERC20TransactionID(id types.ERC20Hash) (t
 	return
 }
 
-func applyERC20AddressMapping(tx *bolt.Tx, tftaddr rivinetypes.UnlockHash, erc20addr types.ERC20Address) error {
-	btft, berc20 := rivbin.Marshal(tftaddr), rivbin.Marshal(erc20addr)
+func applyERC20AddressMapping(tx *bolt.Tx, addr rivinetypes.UnlockHash, erc20addr types.ERC20Address) error {
+	briv, berc20 := rivbin.Marshal(addr), rivbin.Marshal(erc20addr)
 
-	// store ERC20->TFT mapping
-	bucket := tx.Bucket(bucketERC20ToTFTAddresses)
+	// store ERC20->Rivine mapping
+	bucket := tx.Bucket(bucketERC20ToRivineAddresses)
 	if bucket == nil {
-		return errors.New("corrupt transaction DB: ERC20->TFT bucket does not exist")
+		return errors.New("corrupt transaction DB: ERC20->Rivine bucket does not exist")
 	}
-	err := bucket.Put(berc20, btft)
+	err := bucket.Put(berc20, briv)
 	if err != nil {
-		return fmt.Errorf("error while storing ERC20->TFT address mapping: %v", err)
+		return fmt.Errorf("error while storing ERC20->Rivine address mapping: %v", err)
 	}
 
-	// store TFT->ERC20 mapping
-	bucket = tx.Bucket(bucketTFTToERC20Addresses)
+	// store Rivine->ERC20 mapping
+	bucket = tx.Bucket(bucketRivineToERC20Addresses)
 	if bucket == nil {
-		return errors.New("corrupt transaction DB: TFT->ERC20 bucket does not exist")
+		return errors.New("corrupt transaction DB: Rivine->ERC20 bucket does not exist")
 	}
-	err = bucket.Put(btft, berc20)
+	err = bucket.Put(briv, berc20)
 	if err != nil {
-		return fmt.Errorf("error while storing TFT->ERC20 address mapping: %v", err)
+		return fmt.Errorf("error while storing Rivine->ERC20 address mapping: %v", err)
 	}
 
 	// done
 	return nil
 }
-func revertERC20AddressMapping(tx *bolt.Tx, tftaddr rivinetypes.UnlockHash, erc20addr types.ERC20Address) error {
-	btft, berc20 := rivbin.Marshal(tftaddr), rivbin.Marshal(erc20addr)
+func revertERC20AddressMapping(tx *bolt.Tx, addr rivinetypes.UnlockHash, erc20addr types.ERC20Address) error {
+	briv, berc20 := rivbin.Marshal(addr), rivbin.Marshal(erc20addr)
 
-	// delete ERC20->TFT mapping
-	bucket := tx.Bucket(bucketERC20ToTFTAddresses)
+	// delete ERC20->Rivine mapping
+	bucket := tx.Bucket(bucketERC20ToRivineAddresses)
 	if bucket == nil {
-		return errors.New("corrupt transaction DB: ERC20->TFT bucket does not exist")
+		return errors.New("corrupt transaction DB: ERC20->Rivine bucket does not exist")
 	}
 	err := bucket.Delete(berc20)
 	if err != nil {
-		return fmt.Errorf("error while deleting ERC20->TFT address mapping: %v", err)
+		return fmt.Errorf("error while deleting ERC20->Rivine address mapping: %v", err)
 	}
 
-	// delete TFT->ERC20 mapping
-	bucket = tx.Bucket(bucketTFTToERC20Addresses)
+	// delete Rivine->ERC20 mapping
+	bucket = tx.Bucket(bucketRivineToERC20Addresses)
 	if bucket == nil {
-		return errors.New("corrupt transaction DB: TFT->ERC20 bucket does not exist")
+		return errors.New("corrupt transaction DB: Rivine->ERC20 bucket does not exist")
 	}
-	err = bucket.Delete(btft)
+	err = bucket.Delete(briv)
 	if err != nil {
-		return fmt.Errorf("error while deleting TFT->ERC20 address mapping: %v", err)
+		return fmt.Errorf("error while deleting Rivine->ERC20 address mapping: %v", err)
 	}
 
 	// done
 	return nil
 }
 
-func getERC20AddressForTFTAddress(tx *bolt.Tx, uh rivinetypes.UnlockHash) (types.ERC20Address, bool, error) {
-	bucket := tx.Bucket(bucketTFTToERC20Addresses)
+func getERC20AddressForRivineAddress(tx *bolt.Tx, uh rivinetypes.UnlockHash) (types.ERC20Address, bool, error) {
+	bucket := tx.Bucket(bucketRivineToERC20Addresses)
 	if bucket == nil {
-		return types.ERC20Address{}, false, errors.New("corrupt transaction DB: TFT->ERC20 bucket does not exist")
+		return types.ERC20Address{}, false, errors.New("corrupt transaction DB: Rivine->ERC20 bucket does not exist")
 	}
 	b := bucket.Get(rivbin.Marshal(uh))
 	if len(b) == 0 {
@@ -293,15 +342,15 @@ func getERC20AddressForTFTAddress(tx *bolt.Tx, uh rivinetypes.UnlockHash) (types
 	var addr types.ERC20Address
 	err := rivbin.Unmarshal(b, &addr)
 	if err != nil {
-		return types.ERC20Address{}, false, fmt.Errorf("failed to fetch ERC20 Address for TFT address %v: %v", uh, err)
+		return types.ERC20Address{}, false, fmt.Errorf("failed to fetch ERC20 Address for Rivine address %v: %v", uh, err)
 	}
 	return addr, true, nil
 }
 
-func getTFTAddressForERC20Address(tx *bolt.Tx, addr types.ERC20Address) (rivinetypes.UnlockHash, bool, error) {
-	bucket := tx.Bucket(bucketERC20ToTFTAddresses)
+func getRivineAddressForERC20Address(tx *bolt.Tx, addr types.ERC20Address) (rivinetypes.UnlockHash, bool, error) {
+	bucket := tx.Bucket(bucketERC20ToRivineAddresses)
 	if bucket == nil {
-		return rivinetypes.UnlockHash{}, false, errors.New("corrupt transaction DB: ERC20->TFT bucket does not exist")
+		return rivinetypes.UnlockHash{}, false, errors.New("corrupt transaction DB: ERC20->Rivine bucket does not exist")
 	}
 	b := bucket.Get(rivbin.Marshal(addr))
 	if len(b) == 0 {
@@ -310,17 +359,17 @@ func getTFTAddressForERC20Address(tx *bolt.Tx, addr types.ERC20Address) (rivinet
 	var uh rivinetypes.UnlockHash
 	err := rivbin.Unmarshal(b, &uh)
 	if err != nil {
-		return rivinetypes.UnlockHash{}, false, fmt.Errorf("failed to fetch TFT Address for ERC20 address %v: %v", addr, err)
+		return rivinetypes.UnlockHash{}, false, fmt.Errorf("failed to fetch Rivine Address for ERC20 address %v: %v", addr, err)
 	}
 	return uh, true, nil
 }
 
-func applyERC20TransactionID(tx *bolt.Tx, erc20id types.ERC20Hash, tftid rivinetypes.TransactionID) error {
+func applyERC20TransactionID(tx *bolt.Tx, erc20id types.ERC20Hash, rivid rivinetypes.TransactionID) error {
 	bucket := tx.Bucket(bucketERC20TransactionIDs)
 	if bucket == nil {
 		return errors.New("corrupt transaction DB: ERC20 TransactionIDs bucket does not exist")
 	}
-	err := bucket.Put(rivbin.Marshal(erc20id), rivbin.Marshal(tftid))
+	err := bucket.Put(rivbin.Marshal(erc20id), rivbin.Marshal(rivid))
 	if err != nil {
 		return fmt.Errorf("error while storing ERC20 TransactionID %v: %v", erc20id, err)
 	}
@@ -339,7 +388,7 @@ func revertERC20TransactionID(tx *bolt.Tx, id types.ERC20Hash) error {
 	return nil
 }
 
-func getTfchainTransactionIDForERC20TransactionID(tx *bolt.Tx, id types.ERC20Hash) (rivinetypes.TransactionID, bool, error) {
+func getTransactionIDForERC20TransactionID(tx *bolt.Tx, id types.ERC20Hash) (rivinetypes.TransactionID, bool, error) {
 	bucket := tx.Bucket(bucketERC20TransactionIDs)
 	if bucket == nil {
 		return rivinetypes.TransactionID{}, false, errors.New("corrupt transaction DB: ERC20 TransactionIDs bucket does not exist")
@@ -351,7 +400,7 @@ func getTfchainTransactionIDForERC20TransactionID(tx *bolt.Tx, id types.ERC20Has
 	var txid rivinetypes.TransactionID
 	err := rivbin.Unmarshal(b, &txid)
 	if err != nil {
-		return rivinetypes.TransactionID{}, false, fmt.Errorf("corrupt transaction DB: invalid tfchain TransactionID fetched for ERC20 TxID %v: %v", id, err)
+		return rivinetypes.TransactionID{}, false, fmt.Errorf("corrupt transaction DB: invalid TransactionID fetched for ERC20 TxID %v: %v", id, err)
 	}
 	return txid, true, nil
 }
