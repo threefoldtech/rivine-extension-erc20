@@ -407,7 +407,7 @@ func (p *Plugin) validateERC20CAddressRegistrationTx(txn modules.ConsensusTransa
 	}
 
 	// get ERC20AddressRegistration Tx
-	eartx, err := erc20types.ERC20AddressRegistrationTransactionFromTransaction(txn.Transaction)
+	eartx, err := erc20types.ERC20AddressRegistrationTransactionFromTransaction(txn.Transaction, p.txVersions.ERC20AddressRegistration)
 	if err != nil {
 		return fmt.Errorf("failed to use tx as an ERC20 AddressRegistration tx: %v", err)
 	}
