@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/spf13/cobra"
 	"github.com/threefoldtech/rivine/pkg/cli"
 	"github.com/threefoldtech/rivine/types"
+	"github.com/spf13/cobra"
 )
 
 func createMergeCmd(*CommandLineClient) *cobra.Command {
