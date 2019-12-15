@@ -13,7 +13,6 @@ Product owners
 --------------
 
 * Rob Van Mieghem ([@robvanmieghem](https://github.com/robvanmieghem))
-* Glen De Cauwsemaecker ([@glendc](https://github.com/glendc))
 
 
 ERC20 Transaction Info
